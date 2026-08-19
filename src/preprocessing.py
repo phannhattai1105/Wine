@@ -1,57 +1,9 @@
-"""
-src/preprocessing.py
-====================
-Data Pipeline module cho đồ án PCA – Wine Dataset.
-
-Module này được import bởi:
-  - notebooks/01_split.ipynb              (load_raw_data, split_data)
-  - notebooks/02_eda_preprocessing.ipynb  (fit_clean_params, clean,
-                                           encode_if_needed, fit_scaler, scale)
-  - src/pca_scratch/ (của Đăng) thông qua tất cả các hàm công khai bên dưới.
-
-RÀNG BUỘC QUAN TRỌNG — KHÔNG dùng scikit-learn
-------------------------------------------------
-Toàn bộ logic trong module này được cài đặt thuần bằng numpy/pandas:
-  - Stratified Split    : tự cài đặt bằng np.random.default_rng + groupby
-  - Standardization     : tự tính mean/std từ train, lưu vào dict
-  - Impute / IQR / Clip : tự tính bằng pandas/numpy
-
-NGUYÊN TẮC CHỐNG LEAKAGE
---------------------------
-Mọi tham số thống kê (median để impute, ngưỡng IQR để detect outlier,
-mean/std để chuẩn hoá) đều CHỈ được học (fit) từ tập Train.
-Val và Test chỉ được transform theo tham số đã học — KHÔNG fit lại.
-
-Thứ tự thực thi thực tế:
-  1. load_raw_data()
-  2. split_data()          <-- Split TRƯỚC
-  3. fit_clean_params()    <-- Fit từ train_df
-  4. clean()               <-- Apply lên train / val / test
-  5. encode_if_needed()    <-- Dự phòng, Wine không cần
-  6. fit_scaler()          <-- Fit từ train_clean_df
-  7. scale()               <-- Apply lên train / val / test
-
-Hàm công khai (public API – không đổi tên, Đăng sẽ import trực tiếp):
-  - load_raw_data(path) -> pd.DataFrame
-  - split_data(df, target_col, test_size, val_size, random_state)
-        -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
-  - fit_clean_params(train_df, numerical_cols) -> dict
-  - clean(df, params, numerical_cols) -> pd.DataFrame
-  - encode_if_needed(df, categorical_cols) -> pd.DataFrame
-  - fit_scaler(train_clean_df, numerical_cols) -> dict
-  - scale(df, scaler, numerical_cols) -> np.ndarray
-  - save_pipeline_params(clean_params, scaler, path) -> None
-  - load_pipeline_params(path) -> dict
-"""
-
 import pickle
 import pathlib
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
 # Danh sách mặc định 13 cột feature của Wine dataset
-# ---------------------------------------------------------------------------
 WINE_NUMERICAL_COLS: list[str] = [
     "Alcohol", "Malic_Acid", "Ash", "Ash_Alcanity", "Magnesium",
     "Total_Phenols", "Flavanoids", "Nonflavanoid_Phenols",
@@ -60,32 +12,12 @@ WINE_NUMERICAL_COLS: list[str] = [
 WINE_TARGET_COL: str = "Customer_Segment"
 
 
-# ===========================================================================
 # 1. LOAD
-# ===========================================================================
-
 def load_raw_data(path: str) -> pd.DataFrame:
-    """Đọc file CSV raw và trả về DataFrame gốc chưa xử lý.
-
-    Args:
-        path: Đường dẫn tới file CSV (tuyệt đối hoặc tương đối từ nơi gọi).
-              Ví dụ: ``"data/raw/Wine.csv"`` hoặc ``"../data/raw/Wine.csv"``.
-
-    Returns:
-        DataFrame với toàn bộ cột gốc, index 0-based (reset tự động từ CSV).
-        Không có bất kỳ bước làm sạch hay biến đổi nào được thực hiện.
-
-    Raises:
-        FileNotFoundError: Nếu ``path`` không tồn tại.
-    """
     df = pd.read_csv(path)
     return df
 
-
-# ===========================================================================
 # 2. SPLIT  (phải gọi TRƯỚC mọi bước fit tham số để tránh data leakage)
-# ===========================================================================
-
 def split_data(
     df: pd.DataFrame,
     target_col: str = "Customer_Segment",
@@ -93,46 +25,7 @@ def split_data(
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Tự cài đặt Stratified Split bằng numpy thuần — KHÔNG dùng sklearn.
 
-    **Quan trọng – Anti-Leakage:**
-    Hàm này PHẢI được gọi TRƯỚC mọi bước fit tham số (fit_clean_params,
-    fit_scaler). Lý do: nếu làm sạch/chuẩn hoá toàn bộ dataset trước khi
-    split, median/IQR/mean/std sẽ bị "nhiễm" thông tin từ Val và Test,
-    dẫn đến data leakage — mô hình trông có vẻ tốt hơn thực tế.
-
-    **Thuật toán Stratified Split tự cài đặt:**
-        1. Dùng ``np.random.default_rng(random_state)`` tạo generator ngẫu
-           nhiên tái lập được (thay thế ``random_state`` của sklearn).
-        2. Nhóm các dòng theo giá trị ``target_col`` (``df.groupby``).
-        3. Với mỗi nhóm, xáo trộn index bằng ``rng.permutation()``, rồi
-           cắt theo tỉ lệ::
-
-               n_test  = round(n * test_size)
-               n_val   = round(n * val_size)
-               n_train = n - n_test - n_val
-
-        4. Gộp index của từng tập qua toàn bộ nhóm nhãn.
-        5. Xáo trộn lại mỗi tập một lần nữa (``rng.permutation``) để tránh
-           dữ liệu bị sắp xếp liên tiếp theo nhóm nhãn, rồi ``reset_index``.
-
-    Kết quả đảm bảo tỉ lệ nhãn (class distribution) được bảo toàn ở cả
-    ba tập Train / Val / Test.
-
-    Args:
-        df: DataFrame đầu vào (raw, chưa xử lý).
-        target_col: Tên cột nhãn dùng để stratify. Mặc định ``"Customer_Segment"``.
-        test_size: Tỉ lệ dành cho tập Test trên tổng dataset. Mặc định 0.15.
-        val_size: Tỉ lệ dành cho tập Val trên tổng dataset. Mặc định 0.15.
-        random_state: Seed để tái lập kết quả. Mặc định 42.
-
-    Returns:
-        Tuple ``(train_df, val_df, test_df)`` — mỗi DataFrame giữ nguyên
-        tất cả cột gốc (bao gồm ``target_col``), index reset về 0-based.
-
-    Raises:
-        ValueError: Nếu ``test_size + val_size >= 1.0``.
-    """
     if test_size + val_size >= 1.0:
         raise ValueError(
             f"test_size ({test_size}) + val_size ({val_size}) phải < 1.0"
@@ -189,45 +82,12 @@ def split_data(
     return train_df, val_df, test_df
 
 
-# ===========================================================================
 # 3. FIT CLEANING PARAMS  (chỉ fit từ train)
-# ===========================================================================
-
 def fit_clean_params(
     train_df: pd.DataFrame,
     numerical_cols: list[str],
 ) -> dict:
-    """Học các tham số làm sạch CHỈ từ tập Train — KHÔNG fit trên Val/Test.
 
-    Tham số được học:
-        - ``median``: median của mỗi cột numerical (để impute missing).
-        - ``iqr_bounds``: ngưỡng dưới/trên IQR của mỗi cột (để clip outlier).
-          Công thức: lower = Q1 − 1.5·IQR, upper = Q3 + 1.5·IQR.
-
-    Lưu ý: Duplicate trong ``train_df`` được drop TRƯỚC khi tính tham số
-    để tránh bias (các dòng lặp sẽ kéo lệch median nếu giữ lại).
-
-    Args:
-        train_df: Tập Train raw (chưa impute, chưa clip, có thể có duplicate).
-        numerical_cols: Danh sách tên cột số để tính tham số.
-                        Cột ``Customer_Segment`` nên được loại khỏi danh sách này.
-
-    Returns:
-        Dict với cấu trúc::
-
-            {
-                "median": {
-                    "Ash": 2.36,
-                    "Hue": 0.96,
-                    ...
-                },
-                "iqr_bounds": {
-                    "Magnesium": (70.25, 138.75),
-                    "Proline"  : (415.0, 1185.0),
-                    ...
-                }
-            }
-    """
     # Drop duplicate trước khi tính tham số để tránh bias
     train_dedup = train_df.drop_duplicates().copy()
 
@@ -255,38 +115,13 @@ def fit_clean_params(
     return params
 
 
-# ===========================================================================
 # 4. CLEAN  (apply lên train / val / test — pure transform, không fit lại)
-# ===========================================================================
-
 def clean(
     df: pd.DataFrame,
     params: dict,
     numerical_cols: list[str],
 ) -> pd.DataFrame:
-    """Làm sạch DataFrame bằng tham số đã học từ Train.
 
-    Hàm này là **pure transform** — chỉ áp dụng tham số có sẵn trong
-    ``params``, tuyệt đối KHÔNG tính lại median/IQR từ ``df`` truyền vào
-    (dù ``df`` là Val hay Test).
-
-    Thứ tự xử lý:
-        1. **Drop duplicate** — xoá trước để không mất dòng missing cần
-           minh hoạ do bị dedup nhầm thứ tự.
-        2. **Fillna** — impute missing bằng ``params["median"]`` (học từ train).
-        3. **Clip outlier** — clip về ``params["iqr_bounds"]`` (học từ train),
-           KHÔNG xoá dòng để giữ nguyên số lượng mẫu.
-
-    Args:
-        df: DataFrame cần làm sạch (train, val, hoặc test).
-        params: Dict tham số trả về từ :func:`fit_clean_params`.
-        numerical_cols: Danh sách cột số cần xử lý.
-
-    Returns:
-        DataFrame mới đã làm sạch, ``reset_index(drop=True)``.
-        Cột ``Customer_Segment`` và các cột khác ngoài ``numerical_cols``
-        được giữ nguyên, không bị chỉnh sửa.
-    """
     result = df.copy()
 
     # ── Bước 1: Drop duplicate ────────────────────────────────────────────
@@ -320,38 +155,12 @@ def clean(
     return result.reset_index(drop=True)
 
 
-# ===========================================================================
 # 5. ENCODE IF NEEDED  (dự phòng — Wine dataset không cần dùng)
-# ===========================================================================
-
 def encode_if_needed(
     df: pd.DataFrame,
     categorical_cols: list[str] | None = None,
 ) -> pd.DataFrame:
-    """One-Hot Encode các cột categorical nếu có — dự phòng cho dataset mở rộng.
 
-    Dataset Wine hiện tại toàn bộ feature đã là kiểu số (numerical), nên
-    hàm này sẽ trả về ``df`` nguyên vẹn và in thông báo bỏ qua. Tuy nhiên
-    logic được viết sẵn để xử lý đúng nếu sau này dataset có thêm cột
-    categorical.
-
-    **Lưu ý Anti-Leakage:** Hàm hiện dùng ``pd.get_dummies()`` trực tiếp
-    trên ``df``, nghĩa là các dummy column được tạo từ chính tập đó.
-    Nếu Val/Test có giá trị categorical chưa từng xuất hiện ở Train, cột
-    sẽ bị thiếu. Để xử lý đúng hơn, cần lưu lại danh sách cột sau
-    ``get_dummies`` trên Train và ``reindex`` Val/Test theo đó — xem
-    comment TODO bên dưới.
-
-    Args:
-        df: DataFrame đầu vào.
-        categorical_cols: Danh sách tên cột cần encode. Nếu ``None`` hoặc
-            rỗng, hàm tự phát hiện cột ``dtype == object`` hoặc ``category``.
-
-    Returns:
-        DataFrame sau khi One-Hot Encode (hoặc nguyên vẹn nếu không có
-        cột categorical). Boolean dummy được giữ nguyên kiểu bool/uint8
-        của ``pd.get_dummies``.
-    """
     # Phát hiện tự động nếu không truyền danh sách
     if not categorical_cols:
         categorical_cols = [
@@ -372,38 +181,12 @@ def encode_if_needed(
     print(f"[encode_if_needed] Shape sau encoding: {result.shape}")
     return result
 
-
-# ===========================================================================
 # 6. FIT SCALER  (chỉ fit từ train_clean — KHÔNG dùng sklearn)
-# ===========================================================================
-
 def fit_scaler(
     train_clean_df: pd.DataFrame,
     numerical_cols: list[str],
 ) -> dict:
-    """Tính mean và std của từng cột feature CHỈ từ tập Train đã clean.
-
-    Tự cài đặt Standardization bằng pandas/numpy — KHÔNG dùng
-    ``sklearn.preprocessing.StandardScaler``.
-
-    Công thức giống với StandardScaler mặc định của sklearn (``ddof=0``,
-    tức population std) để kết quả khớp khi Đăng so sánh ở notebook 04.
-
-    Args:
-        train_clean_df: Tập Train đã qua bước :func:`clean`.
-        numerical_cols: Danh sách cột feature số (không bao gồm cột nhãn).
-
-    Returns:
-        Dict custom scaler::
-
-            {
-                "mean": pd.Series({"Alcohol": 13.0, "Ash": 2.36, ...}),
-                "std" : pd.Series({"Alcohol":  0.81, "Ash": 0.27, ...})
-            }
-
-        Chỉ học từ ``train_clean_df`` — truyền dict này vào :func:`scale`
-        để transform Val/Test mà không tính lại tham số.
-    """
+    
     feature_df = train_clean_df[numerical_cols]
     mean = feature_df.mean()                    # pandas mặc định ddof=1 cho std,
     std  = feature_df.std(ddof=0)               # nhưng ta dùng ddof=0 (population std)
@@ -415,41 +198,13 @@ def fit_scaler(
     return {"mean": mean, "std": std}
 
 
-# ===========================================================================
 # 7. SCALE  (apply lên train / val / test — pure transform, không fit lại)
-# ===========================================================================
-
 def scale(
     df: pd.DataFrame,
     scaler: dict,
     numerical_cols: list[str],
 ) -> np.ndarray:
-    """Chuẩn hoá các cột feature theo công thức z-score dùng scaler đã fit.
 
-    Công thức: ``X_scaled = (X − mean_train) / std_train``
-
-    Hàm này là **pure transform** — LUÔN dùng ``scaler["mean"]`` và
-    ``scaler["std"]`` đã học từ Train, tuyệt đối KHÔNG tính lại mean/std
-    từ ``df`` truyền vào (dù đó là Val hay Test). Nguyên tắc này giống
-    hệt ``transform()`` của sklearn: chỉ áp dụng tham số đã fit, không
-    re-fit.
-
-    Args:
-        df: DataFrame đã qua :func:`clean` (train, val, hoặc test).
-        scaler: Dict ``{"mean": pd.Series, "std": pd.Series}`` trả về
-                từ :func:`fit_scaler` — học từ Train.
-        numerical_cols: Danh sách cột feature cần chuẩn hoá.
-
-    Returns:
-        numpy array shape ``(n_samples, n_features)`` đã chuẩn hoá.
-        Cột ``Customer_Segment`` KHÔNG có mặt trong output này.
-
-    Notes:
-        Nếu một cột có ``std == 0`` (hằng số), kết quả cột đó sẽ là
-        ``0.0`` thay vì ``NaN`` (tránh lỗi chia-cho-0).
-    """
-    # Lấy đúng các cột feature, KHÔNG dùng lại mean/std của df này
-    # mà dùng scaler["mean"] / scaler["std"] từ Train — chống leakage
     X = df[numerical_cols].copy()
 
     mean = scaler["mean"]   # pd.Series học từ Train
@@ -463,26 +218,13 @@ def scale(
     return X_scaled.to_numpy()
 
 
-# ===========================================================================
-# 8. SAVE PIPELINE PARAMS
-# ===========================================================================
 
 def save_pipeline_params(
     clean_params: dict,
     scaler: dict,
     path: str,
 ) -> None:
-    """Lưu cả clean_params và scaler vào một file .pkl bằng pickle.
 
-    Args:
-        clean_params: Dict trả về từ :func:`fit_clean_params`.
-        scaler: Dict trả về từ :func:`fit_scaler`.
-        path: Đường dẫn file .pkl để lưu.
-              Ví dụ: ``"data/processed/preprocessing_params.pkl"``.
-
-    Returns:
-        None. File .pkl được ghi ra đĩa.
-    """
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "clean_params": clean_params,
@@ -493,37 +235,15 @@ def save_pipeline_params(
     print(f"[save_pipeline_params] Đã lưu tham số → {path}")
 
 
-# ===========================================================================
 # 9. LOAD PIPELINE PARAMS
-# ===========================================================================
-
 def load_pipeline_params(path: str) -> dict:
-    """Đọc lại file .pkl đã lưu bởi :func:`save_pipeline_params`.
-
-    Args:
-        path: Đường dẫn file .pkl.
-
-    Returns:
-        Dict với hai key::
-
-            {
-                "clean_params": { "median": {...}, "iqr_bounds": {...} },
-                "scaler":       { "mean": pd.Series, "std": pd.Series  }
-            }
-
-    Raises:
-        FileNotFoundError: Nếu ``path`` không tồn tại.
-    """
     with open(path, "rb") as f:
         payload = pickle.load(f)
     print(f"[load_pipeline_params] Đã tải tham số ← {path}")
     return payload
 
 
-# ===========================================================================
 # SELF-TEST  — chạy thử toàn bộ pipeline trên Wine.csv
-# ===========================================================================
-
 if __name__ == "__main__":
     import sys
     # Buộc stdout dùng UTF-8 để tránh UnicodeEncodeError trên Windows
